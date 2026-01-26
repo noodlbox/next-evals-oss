@@ -17,6 +17,7 @@ export interface LocalEvalOptions {
   noodlboxEnabled?: boolean;
   verbose?: boolean;
   keepWorkDir?: boolean;
+  model?: "opus" | "sonnet" | "haiku";
 }
 
 export interface LocalEvalResult extends EvalResultBase {
@@ -34,7 +35,7 @@ interface CommandResult {
 async function runCommand(
   cmd: string,
   args: string[],
-  options: { cwd?: string; timeout?: number } = {}
+  options: { cwd?: string; timeout?: number; stream?: boolean } = {}
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     const proc = spawn(cmd, args, {
@@ -47,10 +48,53 @@ async function runCommand(
     let stdout = "";
     let stderr = "";
 
-    proc.stdout?.on("data", (data) => (stdout += data.toString()));
-    proc.stderr?.on("data", (data) => (stderr += data.toString()));
+    proc.stdout?.on("data", (data) => {
+      const str = data.toString();
+      stdout += str;
+      if (options.stream) process.stdout.write(str);
+    });
+    proc.stderr?.on("data", (data) => {
+      const str = data.toString();
+      stderr += str;
+      if (options.stream) process.stderr.write(str);
+    });
     proc.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
     proc.on("error", (err) => resolve({ exitCode: 1, stdout, stderr: err.message }));
+  });
+}
+
+async function runCommandWithStdin(
+  cmd: string,
+  args: string[],
+  stdin: string,
+  options: { cwd?: string; timeout?: number; stream?: boolean } = {}
+): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    const proc = spawn(cmd, args, {
+      cwd: options.cwd,
+      env: process.env,
+      timeout: options.timeout,
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout?.on("data", (data) => {
+      const str = data.toString();
+      stdout += str;
+      if (options.stream) process.stdout.write(str);
+    });
+    proc.stderr?.on("data", (data) => {
+      const str = data.toString();
+      stderr += str;
+      if (options.stream) process.stderr.write(str);
+    });
+    proc.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
+    proc.on("error", (err) => resolve({ exitCode: 1, stdout, stderr: err.message }));
+
+    // Write stdin and close
+    proc.stdin?.write(stdin);
+    proc.stdin?.end();
   });
 }
 
@@ -169,6 +213,11 @@ export async function runLocalEval(
 
     // Run Noodlbox if enabled
     if (options.noodlboxEnabled) {
+      if (options.verbose) console.log("  Initializing git repo...");
+      await runCommand("git", ["init"], { cwd: workDir });
+      await runCommand("git", ["add", "."], { cwd: workDir });
+      await runCommand("git", ["commit", "-m", "init"], { cwd: workDir });
+
       if (options.verbose) console.log("  Running noodl analyze...");
       const noodl = await runCommand("noodl", ["analyze", workDir], { cwd: workDir, timeout: 120000 });
       if (noodl.exitCode !== 0 && options.verbose) {
@@ -176,12 +225,16 @@ export async function runLocalEval(
       }
     }
 
-    // Run Claude
+    // Run Claude - pipe prompt via stdin to avoid shell escaping issues
     if (options.verbose) console.log("  Running Claude Code...");
-    const claude = await runCommand(
+    const enhancedPrompt = buildEnhancedPrompt(prompt);
+
+    const model = options.model ?? "opus";
+    const claude = await runCommandWithStdin(
       "claude",
-      ["--print", "--dangerously-skip-permissions", "-p", buildEnhancedPrompt(prompt)],
-      { cwd: workDir, timeout }
+      ["--print", "--model", model, "--dangerously-skip-permissions", "-p", "-"],
+      enhancedPrompt,
+      { cwd: workDir, timeout, stream: options.verbose }
     );
     claudeOutput = claude.stdout + claude.stderr;
 

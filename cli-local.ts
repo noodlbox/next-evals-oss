@@ -23,6 +23,7 @@ function parseArgs(args: string[]) {
     else if (arg === "-e" || arg === "--eval") values.eval = args[++i];
     else if (arg === "-t" || arg === "--timeout") values.timeout = args[++i];
     else if (arg === "-o" || arg === "--output") values.output = args[++i];
+    else if (arg === "-m" || arg === "--model") values.model = args[++i];
     else if (!arg.startsWith("-")) positionals.push(arg);
   }
 
@@ -47,6 +48,7 @@ Options:
   -v, --verbose        Show detailed logs
   -t, --timeout <ms>   Timeout (default: 600000)
   -o, --output <file>  Write results to JSON
+  -m, --model <model>  Model to use: opus, sonnet, haiku (default: opus)
   --no-noodlbox        Disable Noodlbox (enabled by default)
   --keep-work-dir      Keep temp directories for debugging
 
@@ -114,12 +116,16 @@ async function main() {
 
   // Noodlbox enabled by default (use --no-noodlbox to disable)
   const noodlboxEnabled = values.noNoodlbox !== true;
+  const model = values.model ?? "opus";
   const evalOptions = {
     verbose: values.verbose ?? false,
     keepWorkDir: values.keepWorkDir ?? false,
     timeout: values.timeout ? parseInt(values.timeout) : 600000,
     noodlboxEnabled,
+    model: model as "opus" | "sonnet" | "haiku",
   };
+
+  console.log(`📦 Model: ${model}`);
 
   console.log(`\n🔧 Noodlbox: ${noodlboxEnabled ? "enabled" : "disabled"}\n`);
 
