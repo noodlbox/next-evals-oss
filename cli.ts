@@ -8,6 +8,7 @@ import {
   type ClaudeCodeResult,
   runClaudeCodeEval,
 } from "./lib/claude-code-runner";
+import { runLocalEval, type LocalEvalOptions } from "./lib/claude-code-local-runner";
 import { createNewEval, runEval } from "./lib/eval-runner";
 import { formatClaudeCodeResultsTable } from "./lib/format-results";
 import { MODELS } from "./lib/models";
@@ -388,6 +389,10 @@ function parseCliArgs(args: string[]) {
       values["agent-evals"] = true;
     } else if (arg === "--claude-code") {
       values["claude-code"] = true;
+    } else if (arg === "--local") {
+      values["local"] = true;
+    } else if (arg === "--model") {
+      values["model"] = args[++i];
     } else if (arg === "-e" || arg === "--eval") {
       values.eval = args[++i];
     } else if (arg === "--evals") {
@@ -404,6 +409,8 @@ function parseCliArgs(args: string[]) {
       values["pre-hook"] = args[++i];
     } else if (arg === "--retries") {
       values["retries"] = args[++i];
+    } else if (arg === "--no-noodlbox") {
+      values["no-noodlbox"] = true;
     } else if (!arg.startsWith("-")) {
       positionals.push(arg);
     }
@@ -435,6 +442,9 @@ Options:
   -t, --threads <num>     Number of worker threads (default: 1, max: CPU cores)
       --all-models        Run single eval with all models (default: only first model)
       --claude-code       Use Claude Code agent (requires ANTHROPIC_API_KEY, only runs agent-* evals)
+      --local             Run locally instead of Vercel Sandbox (enables Noodlbox by default)
+      --no-noodlbox       Disable Noodlbox for baseline comparison (local mode only)
+      --model <model>     Model for local mode: opus, sonnet, haiku (default: opus)
       --claude-timeout    Timeout for Claude Code in ms (default: 600000 = 10 minutes)
       --pre-hook <cmd>    Command to run in sandbox before Claude Code (e.g., "npx @judegao/next-skills --agent claude")
       --retries <num>     Number of retry attempts for failed evals (default: 0). Runs N+1 concurrent attempts and reports best result. Stops early on 100% pass.
@@ -1553,12 +1563,17 @@ async function main() {
 
     // Claude Code mode
     if (values["claude-code"]) {
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      if (!anthropicKey) {
-        console.error(
-          "❌ Error: ANTHROPIC_API_KEY environment variable is required for Claude Code mode."
-        );
-        process.exit(1);
+      const useLocal = values["local"] === true;
+
+      // Local mode uses Bedrock or local auth, sandbox mode needs ANTHROPIC_API_KEY
+      if (!useLocal) {
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        if (!anthropicKey) {
+          console.error(
+            "❌ Error: ANTHROPIC_API_KEY environment variable is required for Claude Code mode."
+          );
+          process.exit(1);
+        }
       }
 
       const claudeOptions = {
@@ -1567,7 +1582,7 @@ async function main() {
           : 600000, // 10 minutes default
         preHook: values["pre-hook"],
       };
-      
+
       // Validate retries parameter
       let retries = 0;
       if (values["retries"]) {
@@ -1577,6 +1592,23 @@ async function main() {
           process.exit(1);
         }
         retries = retriesValue;
+      }
+
+      const noodlboxEnabled = !values["no-noodlbox"];
+      const localOptions: LocalEvalOptions = {
+        ...claudeOptions,
+        noodlboxEnabled,
+        model: (values["model"] as "opus" | "sonnet" | "haiku") ?? "opus",
+        verbose: values.verbose ?? false,
+      };
+
+      // Helper to run eval with appropriate runner
+      const runEvalFn = useLocal
+        ? (evalPath: string) => runLocalEval(evalPath, localOptions)
+        : (evalPath: string) => runClaudeCodeEvalWithRetries(evalPath, claudeOptions, retries);
+
+      if (useLocal) {
+        console.log(`🔧 Local mode: Noodlbox ${noodlboxEnabled ? 'enabled' : 'DISABLED (baseline)'}, model=${localOptions.model}`);
       }
 
       if (values.all) {
@@ -1597,7 +1629,7 @@ async function main() {
           allEvals.map(async (evalPath) => {
             console.log(` ▶ ${evalPath}`);
             try {
-              const result = await runClaudeCodeEvalWithRetries(evalPath, claudeOptions, retries);
+              const result = await runEvalFn(evalPath);
               const success =
                 result.success &&
                 result.buildSuccess &&
@@ -1722,7 +1754,7 @@ async function main() {
           evalNames.map(async (evalPath: string) => {
             console.log(` ▶ ${evalPath}`);
             try {
-              const result = await runClaudeCodeEvalWithRetries(evalPath, claudeOptions, retries);
+              const result = await runEvalFn(evalPath);
               const success =
                 result.success &&
                 result.buildSuccess &&
@@ -1830,7 +1862,7 @@ async function main() {
 
         console.log(`🤖 Running Claude Code eval: ${evalPath}${retries > 0 ? ` (${retries} retries)` : ''}\n`);
 
-        const result = await runClaudeCodeEvalWithRetries(evalPath, claudeOptions, retries);
+        const result = await runEvalFn(evalPath);
 
         // Display results using the same format as batch mode
         const tableResults = [{

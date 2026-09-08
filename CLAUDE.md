@@ -1,32 +1,36 @@
 # Next.js Evals with Noodlbox
 
-Local evaluation harness for testing Claude Code with Noodlbox.
+Run Next.js evals locally with Noodlbox enabled.
 
-Baseline results (without Noodlbox) are published at: https://nextjs.org/evals
+Baseline results (without Noodlbox): https://nextjs.org/evals
 
 ## Usage
 
 ```bash
-# Run all evals with Noodlbox
-bun cli-local.ts --all
+# Run all agent evals with Noodlbox (local mode)
+bun cli.ts --claude-code --local --all
 
 # Single eval with verbose output
-bun cli-local.ts --eval 001-server-component --verbose
+bun cli.ts --claude-code --local --eval agent-000-app-router-migration-simple --verbose
 
-# Save results to JSON
-bun cli-local.ts --all -o results.json
-
-# Debug mode - keep temp directories
-bun cli-local.ts --eval 001-server-component --keep-work-dir
+# Use faster model for testing
+bun cli.ts --claude-code --local --eval agent-000-app-router-migration-simple --model haiku
 ```
 
-## Flow
+## Flags
+
+- `--claude-code` - Use Claude Code agent
+- `--local` - Run locally instead of Vercel Sandbox (enables Noodlbox)
+- `--model <opus|sonnet|haiku>` - Model to use (default: opus)
+- `--verbose` - Show detailed logs
+
+## Local Mode Flow
 
 1. Creates temp directory per eval
 2. Copies workspace files (excluding tests)
 3. Installs dependencies
-4. Runs `noodl analyze` (if enabled)
+4. Initializes git repo and runs `nbx analyze`
 5. Runs `claude --print --dangerously-skip-permissions`
 6. Copies test files in
 7. Runs build/lint/test validation
-8. Cleans up (unless `--keep-work-dir`)
+8. Cleans up temp directory

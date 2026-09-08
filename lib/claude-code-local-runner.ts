@@ -2,9 +2,9 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import type { ClaudeCodeResult, ClaudeCodeEvalOptions } from "./claude-code-runner";
 import {
   DEFAULT_TIMEOUT,
-  EvalResultBase,
   getEvalPaths,
   validateEval,
   collectFiles,
@@ -12,18 +12,11 @@ import {
   getTemplateFiles,
 } from "./eval-shared";
 
-export interface LocalEvalOptions {
-  timeout?: number;
+export interface LocalEvalOptions extends ClaudeCodeEvalOptions {
   noodlboxEnabled?: boolean;
   verbose?: boolean;
   keepWorkDir?: boolean;
   model?: "opus" | "sonnet" | "haiku";
-}
-
-export interface LocalEvalResult extends EvalResultBase {
-  workDir?: string;
-  transcript?: string;
-  noodlboxUsed?: boolean;
 }
 
 interface CommandResult {
@@ -67,12 +60,12 @@ async function runCommandWithStdin(
   cmd: string,
   args: string[],
   stdin: string,
-  options: { cwd?: string; timeout?: number; stream?: boolean } = {}
+  options: { cwd?: string; timeout?: number; stream?: boolean; env?: NodeJS.ProcessEnv } = {}
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     const proc = spawn(cmd, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       timeout: options.timeout,
     });
 
@@ -92,7 +85,6 @@ async function runCommandWithStdin(
     proc.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
     proc.on("error", (err) => resolve({ exitCode: 1, stdout, stderr: err.message }));
 
-    // Write stdin and close
     proc.stdin?.write(stdin);
     proc.stdin?.end();
   });
@@ -138,38 +130,14 @@ async function captureGeneratedFiles(workDir: string): Promise<Record<string, st
   return files;
 }
 
-async function findRecentTranscript(): Promise<string | undefined> {
-  const projectsDir = path.join(os.homedir(), ".claude", "projects");
-  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-
-  try {
-    const dirs = await fs.readdir(projectsDir);
-    for (const dir of dirs) {
-      const dirPath = path.join(projectsDir, dir);
-      const stat = await fs.stat(dirPath);
-      if (!stat.isDirectory()) continue;
-
-      const files = await fs.readdir(dirPath);
-      const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
-
-      for (const file of jsonlFiles) {
-        const filePath = path.join(dirPath, file);
-        const fileStat = await fs.stat(filePath);
-        if (fileStat.mtime.getTime() > fiveMinutesAgo) {
-          return await fs.readFile(filePath, "utf8");
-        }
-      }
-    }
-  } catch {
-    // Transcript capture is best-effort
-  }
-  return undefined;
-}
-
+/**
+ * Run Claude Code eval locally (without Vercel Sandbox).
+ * Returns same ClaudeCodeResult interface as sandbox runner.
+ */
 export async function runLocalEval(
   evalPath: string,
   options: LocalEvalOptions = {}
-): Promise<LocalEvalResult> {
+): Promise<ClaudeCodeResult> {
   const paths = getEvalPaths(evalPath);
   await validateEval(paths);
 
@@ -189,14 +157,12 @@ export async function runLocalEval(
     }
   };
 
-  const makeResult = (partial: Partial<LocalEvalResult>): LocalEvalResult => ({
+  const makeResult = (partial: Partial<ClaudeCodeResult>): ClaudeCodeResult => ({
     success: false,
     output: claudeOutput,
     duration: Date.now() - startTime,
     evalPath,
     timestamp: new Date().toISOString(),
-    workDir: options.keepWorkDir ? workDir : undefined,
-    noodlboxUsed: options.noodlboxEnabled ?? false,
     ...partial,
   });
 
@@ -211,30 +177,47 @@ export async function runLocalEval(
     const install = await runCommand("pnpm", ["install"], { cwd: workDir, timeout: 120000 });
     if (install.exitCode !== 0) throw new Error(`pnpm install failed: ${install.stderr}`);
 
-    // Run Noodlbox if enabled
+    // Run Noodlbox if enabled - analyze workspace (plugin must be installed globally)
     if (options.noodlboxEnabled) {
+      // Initialize git repo (required for nbx analyze)
       if (options.verbose) console.log("  Initializing git repo...");
       await runCommand("git", ["init"], { cwd: workDir });
       await runCommand("git", ["add", "."], { cwd: workDir });
       await runCommand("git", ["commit", "-m", "init"], { cwd: workDir });
 
-      if (options.verbose) console.log("  Running noodl analyze...");
-      const noodl = await runCommand("noodl", ["analyze", workDir], { cwd: workDir, timeout: 120000 });
-      if (noodl.exitCode !== 0 && options.verbose) {
-        console.log(`  Warning: noodl analyze failed: ${noodl.stderr}`);
+      // Analyze the workspace to build the knowledge graph
+      if (options.verbose) console.log("  Running nbx analyze...");
+      const analysis = await runCommand("nbx", ["analyze", workDir], {
+        cwd: workDir,
+        timeout: 120000,
+      });
+      if (analysis.exitCode !== 0 && options.verbose) {
+        console.log(`  Warning: nbx analyze failed: ${analysis.stderr}`);
       }
     }
 
-    // Run Claude - pipe prompt via stdin to avoid shell escaping issues
+    // Run Claude - pipe prompt via stdin
     if (options.verbose) console.log("  Running Claude Code...");
+    const model = options.model ?? "opus";
     const enhancedPrompt = buildEnhancedPrompt(prompt);
 
-    const model = options.model ?? "opus";
+    // Build claude args - add debug hooks flag if noodlbox is enabled
+    const claudeArgs = ["--print", "--model", model, "--dangerously-skip-permissions"];
+    if (options.noodlboxEnabled) {
+      claudeArgs.push("--debug", "hooks");
+    }
+    claudeArgs.push("-p", "-");
+
+    // Set NOODLBOX_HOOK_DEBUG to see hook activity
+    const claudeEnv = options.noodlboxEnabled
+      ? { ...process.env, NOODLBOX_HOOK_DEBUG: "true" }
+      : process.env;
+
     const claude = await runCommandWithStdin(
       "claude",
-      ["--print", "--model", model, "--dangerously-skip-permissions", "-p", "-"],
+      claudeArgs,
       enhancedPrompt,
-      { cwd: workDir, timeout, stream: options.verbose }
+      { cwd: workDir, timeout, stream: options.verbose, env: claudeEnv }
     );
     claudeOutput = claude.stdout + claude.stderr;
 
@@ -254,7 +237,6 @@ export async function runLocalEval(
     ]);
 
     const generatedFiles = await captureGeneratedFiles(workDir);
-    const transcript = await findRecentTranscript();
 
     await cleanup();
 
@@ -267,7 +249,6 @@ export async function runLocalEval(
       lintOutput: lint.stdout + lint.stderr,
       testOutput: test.stdout + test.stderr,
       generatedFiles,
-      transcript,
     });
   } catch (error) {
     await cleanup();
